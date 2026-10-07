@@ -1,0 +1,21 @@
+[package]
+name = "bevy_voxelquest"
+version = "0.1.0"
+edition = "2024"
+license = "Zlib"
+description = "Voxel Quest's procedural ray-marched voxel rendering (and optional physics) as Bevy plugins"
+
+[features]
+default = ["physics"]
+physics = ["dep:avian3d"]
+
+[dependencies]
+bevy = "0.19"
+avian3d = { version = "0.7", optional = true }
+serde_json = "1"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
