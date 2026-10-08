@@ -24,8 +24,8 @@ passes) is not ported. Instead, every ray-marched object is a normal Bevy entity
 - A custom `Material` marches the SDF inside that box and writes real depth.
 
 So voxel terrain and buildings depth-sort with your regular meshes. They cast
-and receive Bevy shadow maps, because the prepass/shadow shader marches too.
-They also get frustum culling, fog and multiple cameras.
+and receive Bevy shadow maps, and they write correct motion vectors, so TAA
+and motion blur work. They also get frustum culling, fog and multiple cameras.
 
 ## Plugins
 
@@ -101,6 +101,8 @@ Environment variables:
 - `VQ_PIXELATE=4` starts pixelated.
 - `VQ_DROP_CRATES=1` drops crates onto the castle at startup.
 - `VQ_PBR=1` starts with PBR lighting.
+- `VQ_NO_TAA=1` / `VQ_NO_SHADOWS=1` turn off TAA / sun shadows.
+- `VQ_BENCH=N` prints the average frame time over N frames and exits.
 - `VQ_SCREENSHOT=out.png` saves a screenshot and exits.
 
 ## How it fits together
@@ -147,22 +149,44 @@ port line for line.
 
 ## Performance notes
 
-- Each terrain tile and structure is a box whose pixels each run a ray march.
-  Writing depth from the fragment shader disables early-Z, so tiles behind the
-  one that hits still march their own segment.
-- Bounds are tight per tile, which keeps that cheap. Use `view_radius_tiles`,
-  `max_steps` and the rock layers' `fade_distance` to tune.
-- Shadow cascades re-march the scene from the light, so they cost about as
-  much as the main view each. Fewer cascades or a shorter
-  `maximum_distance` help a lot.
-- `VqPixelate { factor: 4 }` makes everything about 16× cheaper and matches
-  VQ's look. VQ itself marched at a quarter of its G-buffer resolution.
+- **Ray-marched boxes:** each terrain tile and structure is a box whose pixels
+  each run a ray march. Away from the surface, the terrain march steps with a
+  cheap lower bound: one heightmap lookup, then the bare heightfield. Rock
+  detail is only evaluated within the band it can affect.
+- **Terrain shadows:** terrain does **not** ray-march into shadow maps. Each
+  tile has an invisible heightfield proxy mesh that casts its shadows
+  (`shadow_proxy_bias` lowers it to avoid acne). A short SDF soft-shadow march
+  in the main pass adds back the small-scale self-shadowing of rocks.
+  Ray-marching every shadow-map texel used to be over 90% of the frame.
+  Structures still ray-march into shadow maps; they are small in light space.
+- **Depth prepass reuse:** with a depth prepass (TAA and SSAO add one), the
+  prepass does the marching. The main pass reads the hit back from the
+  prepass depth and only shades, so TAA costs little extra and can even be
+  faster than without it.
+- **Tuning:** use `view_radius_tiles`, `max_steps` and the rock layers'
+  `fade_distance`.
+- **Pixelated look:** `VqPixelate { factor: 4 }` makes everything about 16×
+  cheaper and matches VQ's look. VQ itself marched at a quarter of its
+  G-buffer resolution.
+- **Measured** on a CPU software renderer (lavapipe) at 640×360, with a
+  3-cascade shadowed sun. These are relative numbers only; no real-GPU numbers
+  yet.
+
+  | Version | Frame time |
+  |---|---|
+  | Initial port | 15.2 s |
+  | Cheaper marching | 12.9 s |
+  | Shadow proxies | 1.24 s |
+  | Shadow proxies + TAA | 1.06 s |
+
+  `VQ_BENCH=N cargo run --release --example world` prints your own.
 
 ## Differences from Voxel Quest
 
-- **Lighting:** shadows come from Bevy shadow maps instead of VQ's in-shader
-  soft and hard shadow marches. AO is a short SDF march along the normal
-  instead of SSAO.
+- **Lighting:** large-scale shadows come from Bevy shadow maps (terrain via
+  proxy meshes). Only the fine self-shadowing uses VQ-style in-shader soft
+  shadows, and only in palette mode; PBR mode uses shadow maps alone. AO is a
+  short SDF march along the normal instead of SSAO.
 - **Not ported:** radiosity, the water refraction pass and the median filter.
   Bevy's fog stands in for VQ's fog shader.
 - **Missing data:** VQ's `voro.bmp`, which caps mountains into mesas, is
