@@ -41,6 +41,7 @@ use bevy::{asset::embedded_asset, prelude::*, shader::load_shader_library};
 
 pub mod noise;
 pub mod palette;
+#[cfg(feature = "pixelate")]
 pub mod pixelate;
 mod raymarch;
 pub mod settings;
@@ -59,7 +60,6 @@ pub mod prelude {
     pub use crate::{
         VoxelQuestPlugins, VqCorePlugin,
         palette::{VqMat, VqPalette},
-        pixelate::{VqPixelate, VqPixelatePlugin},
         settings::*,
         sky::{VqSky, VqSkyPlugin},
         structure::{VqPrim, VqPrimTemplate, VqStructure, VqStructurePlugin},
@@ -69,6 +69,8 @@ pub mod prelude {
 
     #[cfg(feature = "physics")]
     pub use crate::physics::VqPhysicsPlugin;
+    #[cfg(feature = "pixelate")]
+    pub use crate::pixelate::{VqPixelate, VqPixelatePlugin};
 }
 
 /// All Voxel Quest plugins.
@@ -84,8 +86,9 @@ impl PluginGroup for VoxelQuestPlugins {
             .add(terrain::VqTerrainPlugin)
             .add(structure::VqStructurePlugin)
             .add(water::VqWaterPlugin)
-            .add(sky::VqSkyPlugin)
-            .add(pixelate::VqPixelatePlugin);
+            .add(sky::VqSkyPlugin);
+        #[cfg(feature = "pixelate")]
+        let group = group.add(pixelate::VqPixelatePlugin);
         #[cfg(feature = "physics")]
         let group = group.add(physics::VqPhysicsPlugin);
         group

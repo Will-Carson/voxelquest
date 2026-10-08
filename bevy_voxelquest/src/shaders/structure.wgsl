@@ -437,6 +437,7 @@ fn fragment(in: VertexOutput) -> VqFragmentOutput {
     s.ao = solid_ao(hit.pos, n_vq);
     s.specular = 0.0;
     s.contact_shadow = 1.0;
+    s.albedo = vec4(0.0);
 
     var out: VqFragmentOutput;
     out.color = shade(s, in.position);

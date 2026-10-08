@@ -17,8 +17,11 @@ pub struct VqWorldSettings {
     pub world_size: f32,
     /// Resolution of the generated heightmap (it is square).
     pub heightmap_resolution: u32,
-    /// Height of a heightmap value of 1.0 (VQ: `heightMapMaxInCells`).
+    /// Height of a heightmap value of 1.0 above [`Self::base_height`]
+    /// (VQ: `heightMapMaxInCells`).
     pub height_max: f32,
+    /// World height of a heightmap value of 0.
+    pub base_height: f32,
     /// Sea level as a fraction of [`Self::height_max`] (VQ: `seaLevel`, 100/255).
     pub sea_level: f32,
     /// Frequencies of the 4 heightmap octaves (VQ: `mapFreqs`).
@@ -69,6 +72,7 @@ pub struct RockLayer {
 
 /// Source of the base heightmap.
 #[derive(Clone, Debug, Default, Reflect)]
+#[reflect(opaque)]
 pub enum HeightmapSource {
     /// Fully procedural: tiling ridged noise stands in for Voxel Quest's
     /// real-world heightmaps, then goes through VQ's `TerrainMix` step.
@@ -79,6 +83,33 @@ pub enum HeightmapSource {
     /// Paths are filesystem paths, read synchronously at startup. Falls back
     /// to [`HeightmapSource::Procedural`] if they can't be read.
     VoxelQuestBmp { hm0: String, hm1: String },
+    /// Your own heightmap, e.g. a world map from another generator: real
+    /// heights in world units, not tiling, with optional per-texel colours
+    /// and rockiness. See [`CustomHeightmap`].
+    Custom(std::sync::Arc<CustomHeightmap>),
+    /// Generate nothing at startup. Build a [`crate::terrain::TerrainField`]
+    /// later and insert it with [`crate::terrain::VqTerrain::new`]; remove
+    /// the resource to clear the terrain again.
+    Manual,
+}
+
+/// A heightmap supplied by the app (Bevy coordinates, Y up).
+#[derive(Clone, Debug, Default)]
+pub struct CustomHeightmap {
+    /// Texels across (along +X) and down (along +Z).
+    pub width: usize,
+    pub height: usize,
+    /// World-space heights, row-major: `heights[z * width + x]`.
+    pub heights: Vec<f32>,
+    /// 0..1 per texel: how much of the Voronoi rock layers to apply
+    /// (crags on mountains, smooth lowlands). Empty means 1 everywhere.
+    pub rockiness: Vec<f32>,
+    /// sRGB albedo per texel, replacing the palette's terrain materials.
+    /// Empty means VQ's own height/slope rules pick palette materials.
+    pub colors: Vec<[u8; 3]>,
+    /// World XZ of the outer corner of texel (0, 0), and the texel size.
+    pub origin: Vec2,
+    pub cell_size: f32,
 }
 
 impl Default for VqWorldSettings {
@@ -88,6 +119,7 @@ impl Default for VqWorldSettings {
             world_size: 4096.0,
             heightmap_resolution: 1024,
             height_max: 256.0,
+            base_height: 0.0,
             sea_level: 100.0 / 255.0,
             map_freqs: Vec4::new(1.0, 1.0, 2.0, 4.0),
             map_amps: Vec4::new(1.0, 0.25, 0.125, 0.0625),
@@ -124,7 +156,7 @@ impl Default for VqWorldSettings {
 impl VqWorldSettings {
     /// World-space height of the sea surface (before waves).
     pub fn sea_height(&self) -> f32 {
-        self.sea_level * self.height_max
+        self.base_height + self.sea_level * self.height_max
     }
 }
 

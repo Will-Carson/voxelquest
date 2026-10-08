@@ -6,13 +6,19 @@ license = "Zlib"
 description = "Voxel Quest's procedural ray-marched voxel rendering (and optional physics) as Bevy plugins"
 
 [features]
-default = ["physics"]
+default = ["physics", "pixelate"]
 physics = ["dep:avian3d"]
+# The low-resolution look (`VqPixelate`) presents through Bevy UI.
+pixelate = ["bevy/bevy_ui", "bevy/bevy_ui_render"]
 
 [dependencies]
-bevy = "0.19"
+# Only what the renderer needs, so apps that trim Bevy's features keep them trimmed.
+bevy = { version = "0.19", default-features = false, features = ["std", "bevy_log", "3d_bevy_render"] }
 avian3d = { version = "0.7", optional = true }
 serde_json = "1"
+
+[dev-dependencies]
+bevy = "0.19"
 
 [profile.dev]
 opt-level = 1

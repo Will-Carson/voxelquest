@@ -9,7 +9,7 @@
 #import bevy_voxelquest::common::{
     view_ray, ray_box, to_vq, from_vq, Surface, VqFragmentOutput, is_orthographic, depth_at,
 }
-#import bevy_voxelquest::terrain_sdf::{terrain, ter_val, ter_dist, ter_normal, ter_march_dist}
+#import bevy_voxelquest::terrain_sdf::{terrain, ter_val, ter_dist, ter_normal, ter_march_dist, base_height, albedo_at}
 #import bevy_voxelquest::noise::hash_vec
 #import bevy_pbr::mesh_view_bindings::view
 
@@ -95,12 +95,14 @@ fn randf3(p: vec3<f32>) -> f32 {
 
 // Terrain material rules from PrimShader.c `castLand`, with distances scaled
 // from VQ's 4096-cell height range to `terrain.height_max`.
-fn classify(p: vec3<f32>, n: vec3<f32>, cam_dist: f32, out_mat: ptr<function, u32>, out_var: ptr<function, f32>) {
+fn classify(p_world: vec3<f32>, n: vec3<f32>, cam_dist: f32, out_mat: ptr<function, u32>, out_var: ptr<function, f32>) {
+    // VQ's rules work in heights above the map's base.
+    let p = vec3(p_world.xy, p_world.z - base_height());
     let H = terrain.height_max;
     let k = H / 4096.0;
     let S = 512.0 * k;
     let sea = terrain.sea_level;
-    let tv = ter_val(p, cam_dist);
+    let tv = ter_val(p_world, cam_dist);
 
     let cam01 = clamp(cam_dist * 4.0 / (terrain.world_size * 4.0), 0.0, 1.0);
     let speckle = randf3(floor(p * 32.0) / 32.0) * clamp(1.0 - cam01 * 4.0, 0.0, 1.0);
@@ -132,6 +134,19 @@ fn classify(p: vec3<f32>, n: vec3<f32>, cam_dist: f32, out_mat: ptr<function, u3
 }
 
 #ifndef PREPASS_PIPELINE
+// Albedo from a custom map's colours, with steep ground showing bare rock
+// (the map's texels are far coarser than a cliff).
+fn custom_albedo(p: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
+    let a = albedo_at(p.xy);
+    if a.a <= 0.0 {
+        return vec4(0.0);
+    }
+    let speckle = hash_vec(floor(p * 0.5)) * 0.08 - 0.04;
+    let steep = smoothstep(0.55, 0.85, 1.0 - n.z);
+    let rock = vec3(0.47, 0.45, 0.43) + speckle;
+    return vec4(mix(a.rgb + speckle, rock, steep), 1.0);
+}
+
 // Short soft-shadow march towards the light (VQ's `softShadow`) for the
 // small-scale self-shadowing of rocks and cracks that the coarse shadow
 // proxy can't resolve. Large-scale shadows come from the shadow maps.
@@ -234,6 +249,7 @@ fn fragment(in: VertexOutput) -> VqFragmentOutput {
     s.ao = terrain_ao(hit.pos, n_vq, hit.cam_dist);
     s.contact_shadow = contact_shadow(hit.pos, n_vq, hit.cam_dist);
     s.specular = select(0.0, 0.5, mat == MAT_SNOW);
+    s.albedo = custom_albedo(hit.pos, n_vq);
 
     var out: VqFragmentOutput;
     out.color = shade(s, in.position);

@@ -141,6 +141,8 @@ struct Surface {
     specular: f32,
     // 0..1 multiplier on the shadow-map term for fine self-shadowing.
     contact_shadow: f32,
+    // sRGB albedo that replaces the palette when alpha > 0 (custom maps).
+    albedo: vec4<f32>,
 }
 
 #ifndef PREPASS_PIPELINE
@@ -195,11 +197,17 @@ fn shade_vq(s: Surface, frag_coord: vec4<f32>) -> vec3<f32> {
 
     // --- PostLighting ---
     let variation = s.variation * ao;
-    var col = vec3(
-        palette(s.mat, variation, lit.r).r,
-        palette(s.mat, variation, lit.g).g,
-        palette(s.mat, variation, lit.b).b,
-    );
+    var col: vec3<f32>;
+    if s.albedo.a > 0.0 {
+        // A given albedo instead of a palette ramp: light it directly.
+        col = s.albedo.rgb * (lit * 1.25 + 0.1);
+    } else {
+        col = vec3(
+            palette(s.mat, variation, lit.r).r,
+            palette(s.mat, variation, lit.g).g,
+            palette(s.mat, variation, lit.b).b,
+        );
+    }
     var hsv = rgb2hsv(col);
     hsv.z = rgb2hsv(lit).z;
     col = mix(col, hsv2rgb(hsv), 0.25);
@@ -241,7 +249,10 @@ fn make_pbr_input(s: Surface, frag_coord: vec4<f32>, base_color: vec3<f32>) -> p
 // Full shading entry point: lighting + Bevy fog / tonemapping.
 fn shade(s: Surface, frag_coord: vec4<f32>) -> vec4<f32> {
     var color: vec4<f32>;
-    let base = srgb_to_linear(palette(s.mat, s.variation, 0.8));
+    var base = srgb_to_linear(palette(s.mat, s.variation, 0.8));
+    if s.albedo.a > 0.0 {
+        base = srgb_to_linear(clamp(s.albedo.rgb, vec3(0.0), vec3(1.0)));
+    }
     let pbr = make_pbr_input(s, frag_coord, base);
     if shading.mode == 1u {
         color = pbr_functions::apply_pbr_lighting(pbr);

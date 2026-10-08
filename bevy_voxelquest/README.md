@@ -143,6 +143,30 @@ Environment variables:
   variation, light)` to tint regular meshes so they match.
   `VqPaletteSource(json)` loads your own `materials.js`.
 
+### Your own heightmap
+
+`HeightmapSource::Custom(Arc<CustomHeightmap>)` renders a heightmap from
+another generator (a world map, an atlas) instead of VQ's:
+
+- **Heights:** real heights in world units, with the sea at y = 0.
+- **Layout:** any width × height, placed by `origin` and `cell_size`. It does
+  not tile; the edges are clamped.
+- **Colours (optional):** per-texel sRGB colours replace the palette's terrain
+  materials. Steep ground fades to bare rock, because map texels are coarser
+  than cliffs.
+- **Rockiness (optional):** per-texel 0..1 values scale the Voronoi rock
+  layers, so crags appear on mountains but not on farmland.
+
+`HeightmapSource::Manual` generates nothing at startup. Build a field on any
+thread with `TerrainField::generate` or `TerrainField::from_custom`. Insert it
+with `VqTerrain::new(field, &mut images, &mut buffers)`. Removing the resource
+clears the tiles, and replacing it swaps terrains. The arcs lab's "far land"
+uses this to draw a 128 km atlas crop around its island.
+
+To embed only the renderer, use `default-features = false`. That drops avian
+physics and the UI-based pixelation, and Bevy's features stay trimmed to
+`3d_bevy_render`.
+
 Coordinates: Bevy is Y-up and Voxel Quest is Z-up. Public APIs use Bevy
 space. The shaders work in VQ space, `(x, -z, y)`, so the original formulas
 port line for line.

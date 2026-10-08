@@ -85,6 +85,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     s.ao = 1.0;
     s.specular = 1.5;
     s.contact_shadow = 1.0;
+    s.albedo = vec4(0.0);
     var color = shade(s, in.position);
     color.a = mix(water.alpha_min, water.alpha_max, fresnel);
     return color;

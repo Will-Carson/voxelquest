@@ -22,6 +22,12 @@ struct TerrainParams {
     bump_depth: f32,
     voro_res: f32,
     grass_flatness: f32,
+    // VQ-space rectangle the heightmap covers: (origin.xy, extent.xy).
+    map_rect: vec4<f32>,
+    // (texels across, texels down, world height of a 0 sample, custom map flag).
+    // A custom map clamps at its edges instead of tiling, has no mesa cap,
+    // carries per-texel rockiness in `.y` and albedo in `albedo`.
+    map_info: vec4<f32>,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> terrain: TerrainParams;
@@ -29,17 +35,39 @@ struct TerrainParams {
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var<storage, read> heightmap: array<vec2<f32>>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(5) var voro_texture: texture_3d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(6) var voro_sampler: sampler;
+// Custom maps only: sRGB albedo per texel, packed RGBA8 (alpha 0 = none).
+@group(#{MATERIAL_BIND_GROUP}) @binding(7) var<storage, read> albedo: array<u32>;
 
-fn hm_texel(x: i32, y: i32) -> vec2<f32> {
-    let n = i32(terrain.hm_res);
-    let xi = ((x % n) + n) % n;
-    let yi = ((y % n) + n) % n;
-    return heightmap[xi + yi * n];
+fn is_custom() -> bool {
+    return terrain.map_info.w > 0.5;
 }
 
-// VQ `bilin`: manual bilinear filtering with wrap; uv in texture periods.
+// World height of a heightmap sample of 0.
+fn base_height() -> f32 {
+    return terrain.map_info.z;
+}
+
+// Heightmap coordinates (in map periods) of a VQ-space position.
+fn map_uv(xy: vec2<f32>) -> vec2<f32> {
+    return (xy - terrain.map_rect.xy) / terrain.map_rect.zw;
+}
+
+fn texel_index(x: i32, y: i32) -> i32 {
+    let w = i32(terrain.map_info.x);
+    let h = i32(terrain.map_info.y);
+    if is_custom() {
+        return clamp(x, 0, w - 1) + clamp(y, 0, h - 1) * w;
+    }
+    return (((x % w) + w) % w) + (((y % h) + h) % h) * w;
+}
+
+fn hm_texel(x: i32, y: i32) -> vec2<f32> {
+    return heightmap[texel_index(x, y)];
+}
+
+// VQ `bilin`: manual bilinear filtering (wrapping or clamped); uv in map periods.
 fn hm_bilin(uv: vec2<f32>) -> vec2<f32> {
-    let c = uv * terrain.hm_res - 0.5;
+    let c = uv * terrain.map_info.xy - 0.5;
     let i = floor(c);
     let f = c - i;
     let x = i32(i.x);
@@ -51,6 +79,48 @@ fn hm_bilin(uv: vec2<f32>) -> vec2<f32> {
     return mix(mix(a, b, f.x), mix(cc, d, f.x), f.y);
 }
 
+fn albedo_texel(x: i32, y: i32) -> vec4<f32> {
+    return unpack4x8unorm(albedo[texel_index(x, y)]);
+}
+
+// Bilinear per-texel albedo of a custom map (sRGB, alpha 0 = none).
+fn albedo_at(xy: vec2<f32>) -> vec4<f32> {
+    if !is_custom() {
+        return vec4(0.0);
+    }
+    let c = map_uv(xy) * terrain.map_info.xy - 0.5;
+    let i = floor(c);
+    let f = c - i;
+    let x = i32(i.x);
+    let y = i32(i.y);
+    return mix(
+        mix(albedo_texel(x, y), albedo_texel(x + 1, y), f.x),
+        mix(albedo_texel(x, y + 1), albedo_texel(x + 1, y + 1), f.x),
+        f.y,
+    );
+}
+
+// Mesa cap from VQ's voro map; custom maps are uncapped.
+fn cap_from(h0y: f32, v2: f32) -> f32 {
+    if is_custom() {
+        return 1.0;
+    }
+    return clamp(mix(0.5, 0.95, h0y) + v2 * 0.05, 0.0, 1.0);
+}
+
+// Upper bound of the cap from the first sample alone.
+fn cap_max_from(h0y: f32) -> f32 {
+    if is_custom() {
+        return 1.0;
+    }
+    return clamp(mix(0.5, 0.95, h0y) + 0.05, 0.0, 1.0);
+}
+
+// How strongly the rock layers apply: per texel on custom maps.
+fn rockiness_from(h0y: f32) -> f32 {
+    return select(1.0, h0y, is_custom());
+}
+
 // Voronoi centreness (1 at a cell centre, 0 at its border); tiling.
 fn voro(uvw: vec3<f32>) -> f32 {
     return textureSampleLevel(voro_texture, voro_sampler, uvw, 0.0).r;
@@ -59,8 +129,8 @@ fn voro(uvw: vec3<f32>) -> f32 {
 // VQ `getTerHeight`: returns (signed vertical distance, height 0..1).
 // `h0` is the first octave sample, `hm_bilin(tc * map_freqs.x)`.
 fn ter_height_from(p: vec3<f32>, h0: vec2<f32>) -> vec2<f32> {
-    let tc = p.xy / terrain.world_size;
-    let tc2 = (p.xy + p.z * terrain.octave_shear) / terrain.world_size;
+    let tc = map_uv(p.xy);
+    let tc2 = map_uv(p.xy + p.z * terrain.octave_shear);
     let hm = vec4(
         h0.x,
         hm_bilin(tc2 * terrain.map_freqs.y).x,
@@ -68,14 +138,20 @@ fn ter_height_from(p: vec3<f32>, h0: vec2<f32>) -> vec2<f32> {
         hm_bilin(tc2 * terrain.map_freqs.w).x,
     );
     var dot_val = dot(hm, terrain.map_amps);
-    let v2 = hm_bilin(tc * 8.0).y;
-    let cap = clamp(mix(0.5, 0.95, h0.y) + v2 * 0.05, 0.0, 1.0);
-    dot_val = min(dot_val, cap);
-    return vec2(p.z - dot_val * terrain.height_max, dot_val);
+    var v2 = 0.0;
+    if !is_custom() {
+        v2 = hm_bilin(tc * 8.0).y;
+    }
+    dot_val = min(dot_val, cap_from(h0.y, v2));
+    return vec2(p.z - (base_height() + dot_val * terrain.height_max), dot_val);
+}
+
+fn first_octave(p: vec3<f32>) -> vec2<f32> {
+    return hm_bilin(map_uv(p.xy) * terrain.map_freqs.x);
 }
 
 fn ter_height(p: vec3<f32>) -> vec2<f32> {
-    return ter_height_from(p, hm_bilin(p.xy / terrain.world_size * terrain.map_freqs.x));
+    return ter_height_from(p, first_octave(p));
 }
 
 fn fade(cam_dist: f32, fade_distance: f32) -> f32 {
@@ -92,14 +168,18 @@ struct TerVal {
 // VQ `getTerVal`: heightfield + bumps + three scales of Voronoi rocks.
 // `cam_dist` fades fine detail out with distance (pass 0 for full detail).
 fn ter_val(p: vec3<f32>, cam_dist: f32) -> TerVal {
-    let th = ter_height(p);
+    let h0 = first_octave(p);
+    let th = ter_height_from(p, h0);
     var res = th.x;
-    let tc = p.xy / terrain.world_size;
-    let bump = hm_bilin(tc * 32.0 + 0.74).x;
-    res += bump * terrain.bump_depth;
+    var bump = 0.0;
+    if terrain.bump_depth > 0.0 {
+        bump = hm_bilin(map_uv(p.xy) * 32.0 + 0.74).x;
+        res += bump * terrain.bump_depth;
+    }
+    let rock = rockiness_from(h0.y);
 
     let rl = terrain.rock_large;
-    let fl = fade(cam_dist, rl.w);
+    let fl = fade(cam_dist, rl.w) * rock;
     if fl > 0.0 {
         let patch_v = abs(sin(p.x * rl.x * 6.0) * sin(p.y * rl.x * 6.0) * sin(p.z * rl.x * 6.0));
         let patchy = 0.35 + 0.65 * sqrt(patch_v);
@@ -107,12 +187,12 @@ fn ter_val(p: vec3<f32>, cam_dist: f32) -> TerVal {
         res += clamp(pow(1.0 - v, rl.z), 0.0, 1.0) * rl.y * fl * patchy;
     }
     let rm = terrain.rock_medium;
-    let fm = fade(cam_dist, rm.w);
+    let fm = fade(cam_dist, rm.w) * rock;
     if fm > 0.0 {
         res += pow(1.0 - voro(p * rm.x + 0.37), rm.z) * rm.y * fm;
     }
     let rs = terrain.rock_small;
-    let fs = fade(cam_dist, rs.w);
+    let fs = fade(cam_dist, rs.w) * rock;
     if fs > 0.0 {
         res += pow(1.0 - voro(p * rs.x + 0.71), rs.z) * rs.y * fs;
     }
@@ -146,11 +226,10 @@ fn ter_march_dist(p: vec3<f32>, cam_dist: f32) -> f32 {
     let band = detail_band(cam_dist);
     // Tier 0: one bilinear lookup. The higher octaves add at most the sum of
     // their amplitudes, and the mesa cap is bounded by the first sample too.
-    let h0 = hm_bilin(p.xy / terrain.world_size * terrain.map_freqs.x);
+    let h0 = first_octave(p);
     let a = terrain.map_amps;
-    let cap_max = clamp(mix(0.5, 0.95, h0.y) + 0.05, 0.0, 1.0);
-    let upper = min(h0.x * a.x + a.y + a.z + a.w, cap_max);
-    let bound0 = p.z - upper * terrain.height_max;
+    let upper = min(h0.x * a.x + a.y + a.z + a.w, cap_max_from(h0.y));
+    let bound0 = p.z - (base_height() + upper * terrain.height_max);
     if bound0 > band {
         return bound0;
     }

@@ -22,7 +22,7 @@ use bevy::{
 };
 
 use crate::{
-    HeightmapSource, RockLayer, VqShading, VqWorldSettings, from_vq,
+    CustomHeightmap, HeightmapSource, RockLayer, VqShading, VqWorldSettings, from_vq,
     noise::{calc_noise, ridged_fbm, tiled_noise, voronoi_map, voronoi_volume},
     palette::VqPalette,
     raymarch::{VqShaded, VqShadingUniform, specialize_box, sync_shading},
@@ -53,20 +53,56 @@ impl Plugin for VqTerrainPlugin {
     }
 
     fn finish(&self, app: &mut App) {
-        let settings = app.world().resource::<VqWorldSettings>().clone();
+        let world = app.world_mut();
+        let proxy = world
+            .resource_mut::<Assets<VqShadowProxyMaterial>>()
+            .add(VqShadowProxyMaterial {});
+        world.insert_resource(ShadowProxyMaterial(proxy));
+
+        let settings = world.resource::<VqWorldSettings>().clone();
+        if matches!(settings.heightmap_source, HeightmapSource::Manual) {
+            return;
+        }
         let start = std::time::Instant::now();
         let field = TerrainField::generate(&settings);
-        info!(
-            "bevy_voxelquest: generated {}² terrain in {:.2?}",
-            settings.heightmap_resolution,
-            start.elapsed()
-        );
+        info!("bevy_voxelquest: generated terrain in {:.2?}", start.elapsed());
+        world.resource_scope(|world, mut images: Mut<Assets<Image>>| {
+            let mut buffers = world.resource_mut::<Assets<ShaderBuffer>>();
+            let terrain = VqTerrain::new(field, &mut images, &mut buffers);
+            world.insert_resource(terrain);
+        });
+    }
+}
 
-        let world = app.world_mut();
-        let heightmap = world
-            .resource_mut::<Assets<ShaderBuffer>>()
-            .add(ShaderBuffer::from(field.heightmap.clone()));
+/// The generated terrain. Insert one (see [`VqTerrain::new`]) to show
+/// terrain, replace it to swap terrains, remove it to clear the tiles.
+#[derive(Resource, Clone)]
+pub struct VqTerrain {
+    /// CPU copy of the distance field, for gameplay queries and physics.
+    pub field: Arc<TerrainField>,
+    /// GPU heightmap: `(height, mesa cap or rockiness)` per texel.
+    pub heightmap: Handle<ShaderBuffer>,
+    /// GPU Voronoi rock volume.
+    pub voro: Handle<Image>,
+    /// GPU per-texel albedo of a custom map (one empty texel otherwise).
+    pub albedo: Handle<ShaderBuffer>,
+}
 
+impl VqTerrain {
+    /// Uploads a generated field. Building the field (`TerrainField::generate`)
+    /// is the slow part and can run on another thread; this is cheap.
+    pub fn new(
+        field: TerrainField,
+        images: &mut Assets<Image>,
+        buffers: &mut Assets<ShaderBuffer>,
+    ) -> Self {
+        let heightmap = buffers.add(ShaderBuffer::from(field.heightmap.clone()));
+        let albedo = if field.albedo.is_empty() {
+            vec![0u32]
+        } else {
+            field.albedo.clone()
+        };
+        let albedo = buffers.add(ShaderBuffer::from(albedo));
         let n = field.voro_res as u32;
         let mut voro = Image::new(
             Extent3d {
@@ -87,29 +123,13 @@ impl Plugin for VqTerrainPlugin {
             min_filter: ImageFilterMode::Linear,
             ..default()
         });
-        let voro = world.resource_mut::<Assets<Image>>().add(voro);
-
-        let proxy = world
-            .resource_mut::<Assets<VqShadowProxyMaterial>>()
-            .add(VqShadowProxyMaterial {});
-        world.insert_resource(ShadowProxyMaterial(proxy));
-        world.insert_resource(VqTerrain {
+        VqTerrain {
             field: Arc::new(field),
             heightmap,
-            voro,
-        });
+            voro: images.add(voro),
+            albedo,
+        }
     }
-}
-
-/// The generated terrain.
-#[derive(Resource, Clone)]
-pub struct VqTerrain {
-    /// CPU copy of the distance field, for gameplay queries and physics.
-    pub field: Arc<TerrainField>,
-    /// GPU heightmap: `(height, mesa cap)` per texel.
-    pub heightmap: Handle<ShaderBuffer>,
-    /// GPU Voronoi rock volume.
-    pub voro: Handle<Image>,
 }
 
 /// Marks the entity (usually the camera or player) that terrain tiles are
@@ -151,6 +171,8 @@ pub struct TerrainParams {
     pub bump_depth: f32,
     pub voro_res: f32,
     pub grass_flatness: f32,
+    pub map_rect: Vec4,
+    pub map_info: Vec4,
 }
 
 fn rock_uniform(r: &RockLayer) -> Vec4 {
@@ -163,8 +185,17 @@ fn rock_uniform(r: &RockLayer) -> Vec4 {
 }
 
 impl TerrainParams {
-    pub fn new(s: &VqWorldSettings) -> Self {
+    pub fn new(field: &TerrainField) -> Self {
+        let s = &field.settings;
+        let m = &field.map;
         Self {
+            map_rect: Vec4::new(m.origin.x, m.origin.y, m.extent.x, m.extent.y),
+            map_info: Vec4::new(
+                m.size.x as f32,
+                m.size.y as f32,
+                s.base_height,
+                if m.custom { 1.0 } else { 0.0 },
+            ),
             map_freqs: s.map_freqs,
             map_amps: s.map_amps,
             rock_large: rock_uniform(&s.rocks_large),
@@ -199,6 +230,8 @@ pub struct VqTerrainMaterial {
     #[texture(5, dimension = "3d")]
     #[sampler(6)]
     pub voro: Handle<Image>,
+    #[storage(7, read_only)]
+    pub albedo: Handle<ShaderBuffer>,
 }
 
 impl Material for VqTerrainMaterial {
@@ -307,7 +340,18 @@ fn stream_tiles(
     mut materials: ResMut<Assets<VqTerrainMaterial>>,
     proxy_material: Res<ShadowProxyMaterial>,
 ) {
-    let Some(terrain) = terrain else { return };
+    // No terrain (any more): clear the tiles. A new terrain: start over.
+    let Some(terrain) = terrain else {
+        for (_, e) in loaded.0.drain() {
+            commands.entity(e).despawn();
+        }
+        return;
+    };
+    if terrain.is_changed() {
+        for (_, e) in loaded.0.drain() {
+            commands.entity(e).despawn();
+        }
+    }
     let field = &terrain.field;
     let s = &field.settings;
     let tile = s.tile_size;
@@ -350,7 +394,7 @@ fn stream_tiles(
         let min = Vec3::new(coord.x as f32 * tile, min_h, coord.y as f32 * tile);
         let max = Vec3::new(min.x + tile, max_h, min.z + tile);
 
-        let mut params = TerrainParams::new(s);
+        let mut params = TerrainParams::new(field);
         params.tile_min = min.extend(s.max_steps as f32);
         params.tile_max = max.extend(0.0);
         let material = materials.add(VqTerrainMaterial {
@@ -359,6 +403,7 @@ fn stream_tiles(
             params,
             heightmap: terrain.heightmap.clone(),
             voro: terrain.voro.clone(),
+            albedo: terrain.albedo.clone(),
         });
         let size = max - min;
         let entity = commands
@@ -393,21 +438,43 @@ fn stream_tiles(
 /// All public methods take Bevy (Y-up) coordinates and evaluate the field at
 /// full detail (no distance fade), which is what physics and gameplay want.
 pub struct TerrainField {
+    /// The settings the field was built with. For a custom heightmap the
+    /// height range, sea level and octave settings are filled in from it.
     pub settings: VqWorldSettings,
-    /// `(height 0..1, mesa cap 0..1)`, row-major, `res × res`, tiling.
+    /// `(height 0..1, mesa cap or rockiness 0..1)` per texel, row-major in
+    /// VQ order (row = VQ y).
     pub heightmap: Vec<Vec2>,
-    pub res: usize,
+    /// Packed sRGB albedo per texel (custom maps with colours), else empty.
+    pub albedo: Vec<u32>,
+    /// Where the heightmap lies and how it is sampled.
+    pub map: MapLayout,
     /// Voronoi centreness, `voro_res³`, tiling.
     pub voro: Vec<u8>,
     pub voro_res: usize,
 }
 
+/// Placement of the heightmap in VQ space.
+#[derive(Clone, Copy, Debug)]
+pub struct MapLayout {
+    /// VQ-space corner of texel (0, 0) and the size the map covers.
+    pub origin: Vec2,
+    pub extent: Vec2,
+    /// Texels across and down.
+    pub size: UVec2,
+    /// Custom maps clamp at the edges (no tiling), have no mesa cap and
+    /// carry rockiness in the second channel.
+    pub custom: bool,
+}
+
 impl TerrainField {
-    /// Runs the full generation (heightmap, Voronoi volume, tile bounds).
+    /// Runs the full generation (heightmap, Voronoi volume). With
+    /// [`HeightmapSource::Manual`] this generates the procedural terrain.
     pub fn generate(settings: &VqWorldSettings) -> Self {
+        if let HeightmapSource::Custom(map) = &settings.heightmap_source {
+            return Self::from_custom(settings, map);
+        }
         let res = settings.heightmap_resolution.max(16) as usize;
         let heights = match &settings.heightmap_source {
-            HeightmapSource::Procedural => mix_heightmap(res, settings.seed, None),
             HeightmapSource::VoxelQuestBmp { hm0, hm1 } => match (read_bmp(hm0), read_bmp(hm1)) {
                 (Ok(a), Ok(b)) => mix_heightmap(res, settings.seed, Some([a, b])),
                 (a, b) => {
@@ -418,6 +485,7 @@ impl TerrainField {
                     mix_heightmap(res, settings.seed, None)
                 }
             },
+            _ => mix_heightmap(res, settings.seed, None),
         };
         let caps = voronoi_map(res as u32, 12, settings.seed ^ 0x51ed);
         let heightmap = heights
@@ -425,25 +493,96 @@ impl TerrainField {
             .zip(caps)
             .map(|(h, c)| Vec2::new(h, c))
             .collect();
-        let voro_res = VORO_RES as usize;
-        let voro = voronoi_volume(VORO_RES, VORO_CELLS, settings.seed ^ 0xa11c);
-
         Self {
             settings: settings.clone(),
             heightmap,
-            res,
-            voro,
-            voro_res,
+            albedo: Vec::new(),
+            map: MapLayout {
+                origin: Vec2::ZERO,
+                extent: Vec2::splat(settings.world_size),
+                size: UVec2::splat(res as u32),
+                custom: false,
+            },
+            voro: voronoi_volume(VORO_RES, VORO_CELLS, settings.seed ^ 0xa11c),
+            voro_res: VORO_RES as usize,
         }
     }
 
+    /// Builds a field from an app-supplied heightmap. The sea is at y = 0.
+    pub fn from_custom(settings: &VqWorldSettings, map: &CustomHeightmap) -> Self {
+        let (w, h) = (map.width.max(2), map.height.max(2));
+        assert_eq!(map.heights.len(), w * h, "CustomHeightmap: heights must be width × height");
+        let (lo, hi) = map
+            .heights
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        let range = (hi - lo).max(1.0);
+
+        let mut s = settings.clone();
+        s.base_height = lo;
+        s.height_max = range;
+        s.sea_level = (0.0 - lo) / range;
+        // One octave of the real map: the higher octaves and VQ's bumps
+        // would sample unrelated parts of it. Detail comes from the rocks.
+        s.map_amps = Vec4::new(1.0, 0.0, 0.0, 0.0);
+        s.octave_shear = 0.0;
+        s.bump_depth = 0.0;
+        s.world_size = (w.max(h) as f32) * map.cell_size;
+        s.heightmap_resolution = w.max(h) as u32;
+
+        // VQ y is -Z, so VQ row r is the map's row h - 1 - r.
+        let mut heightmap = Vec::with_capacity(w * h);
+        let mut albedo = Vec::new();
+        for r in 0..h {
+            let row = h - 1 - r;
+            for x in 0..w {
+                let i = row * w + x;
+                let rock = map.rockiness.get(i).copied().unwrap_or(1.0);
+                heightmap.push(Vec2::new((map.heights[i] - lo) / range, rock.clamp(0.0, 1.0)));
+                if let Some(c) = map.colors.get(i) {
+                    albedo.push(u32::from_le_bytes([c[0], c[1], c[2], 255]));
+                }
+            }
+        }
+        if albedo.len() != w * h {
+            albedo.clear();
+        }
+        let extent = Vec2::new(w as f32, h as f32) * map.cell_size;
+        Self {
+            map: MapLayout {
+                origin: Vec2::new(map.origin.x, -(map.origin.y + extent.y)),
+                extent,
+                size: UVec2::new(w as u32, h as u32),
+                custom: true,
+            },
+            settings: s,
+            heightmap,
+            albedo,
+            voro: voronoi_volume(VORO_RES, VORO_CELLS, settings.seed ^ 0xa11c),
+            voro_res: VORO_RES as usize,
+        }
+    }
+
+    fn texel_index(&self, x: i32, y: i32) -> usize {
+        let (w, h) = (self.map.size.x as i32, self.map.size.y as i32);
+        let (x, y) = if self.map.custom {
+            (x.clamp(0, w - 1), y.clamp(0, h - 1))
+        } else {
+            (x.rem_euclid(w), y.rem_euclid(h))
+        };
+        (x + y * w) as usize
+    }
+
     fn hm_texel(&self, x: i32, y: i32) -> Vec2 {
-        let n = self.res as i32;
-        self.heightmap[(x.rem_euclid(n) + y.rem_euclid(n) * n) as usize]
+        self.heightmap[self.texel_index(x, y)]
+    }
+
+    fn map_uv(&self, xy: Vec2) -> Vec2 {
+        (xy - self.map.origin) / self.map.extent
     }
 
     fn hm_bilin(&self, uv: Vec2) -> Vec2 {
-        let c = uv * self.res as f32 - 0.5;
+        let c = uv * self.map.size.as_vec2() - 0.5;
         let i = c.floor();
         let f = c - i;
         let (x, y) = (i.x as i32, i.y as i32);
@@ -483,41 +622,49 @@ impl TerrainField {
     }
 
     /// VQ `getTerHeight` in VQ space: (vertical distance, height 0..1).
-    fn ter_height(&self, p: Vec3) -> Vec2 {
+    fn ter_height(&self, p: Vec3, h0: Vec2) -> Vec2 {
         let s = &self.settings;
-        let tc = Vec2::new(p.x, p.y) / s.world_size;
-        let tc2 = (Vec2::new(p.x, p.y) + p.z * s.octave_shear) / s.world_size;
-        let h0 = self.hm_bilin(tc * s.map_freqs.x);
+        let xy = Vec2::new(p.x, p.y);
+        let tc = self.map_uv(xy);
+        let tc2 = self.map_uv(xy + p.z * s.octave_shear);
         let hm = Vec4::new(
             h0.x,
             self.hm_bilin(tc2 * s.map_freqs.y).x,
             self.hm_bilin(tc2 * s.map_freqs.z).x,
             self.hm_bilin(tc2 * s.map_freqs.w).x,
         );
-        let v2 = self.hm_bilin(tc * 8.0).y;
-        let cap = ((0.5 + (0.95 - 0.5) * h0.y) + v2 * 0.05).clamp(0.0, 1.0);
+        let cap = if self.map.custom {
+            1.0
+        } else {
+            let v2 = self.hm_bilin(tc * 8.0).y;
+            ((0.5 + (0.95 - 0.5) * h0.y) + v2 * 0.05).clamp(0.0, 1.0)
+        };
         let d = hm.dot(s.map_amps).min(cap);
-        Vec2::new(p.z - d * s.height_max, d)
+        Vec2::new(p.z - (s.base_height + d * s.height_max), d)
     }
 
     /// Terrain distance in VQ space at full detail (`ter_val` in WGSL).
     pub fn distance_vq(&self, p: Vec3) -> f32 {
         let s = &self.settings;
-        let mut res = self.ter_height(p).x;
-        let tc = Vec2::new(p.x, p.y) / s.world_size;
-        res += self.hm_bilin(tc * 32.0 + 0.74).x * s.bump_depth;
+        let xy = Vec2::new(p.x, p.y);
+        let h0 = self.hm_bilin(self.map_uv(xy) * s.map_freqs.x);
+        let mut res = self.ter_height(p, h0).x;
+        if s.bump_depth > 0.0 {
+            res += self.hm_bilin(self.map_uv(xy) * 32.0 + 0.74).x * s.bump_depth;
+        }
+        let rock = if self.map.custom { h0.y } else { 1.0 };
 
         let rl = rock_uniform(&s.rocks_large);
         let patch =
             ((p.x * rl.x * 6.0).sin() * (p.y * rl.x * 6.0).sin() * (p.z * rl.x * 6.0).sin()).abs();
         let patchy = 0.35 + 0.65 * patch.sqrt();
         let v = self.voro_sample(p * Vec3::new(rl.x, rl.x, rl.x * 0.5));
-        res += (1.0 - v).powf(rl.z).clamp(0.0, 1.0) * rl.y * patchy;
+        res += (1.0 - v).powf(rl.z).clamp(0.0, 1.0) * rl.y * patchy * rock;
 
         let rm = rock_uniform(&s.rocks_medium);
-        res += (1.0 - self.voro_sample(p * rm.x + 0.37)).powf(rm.z) * rm.y;
+        res += (1.0 - self.voro_sample(p * rm.x + 0.37)).powf(rm.z) * rm.y * rock;
         let rs = rock_uniform(&s.rocks_small);
-        res += (1.0 - self.voro_sample(p * rs.x + 0.71)).powf(rs.z) * rs.y;
+        res += (1.0 - self.voro_sample(p * rs.x + 0.71)).powf(rs.z) * rs.y * rock;
         res
     }
 
@@ -533,7 +680,7 @@ impl TerrainField {
         // Start above the highest possible terrain and walk down; the field's
         // vertical slope is at most ~2.5 (the octave shear tilts it), so steps
         // of 0.4·d never skip a surface.
-        p.z = self.settings.height_max + self.settings.bump_depth + 1.0;
+        p.z = self.settings.base_height + self.settings.height_max + self.settings.bump_depth + 1.0;
         let mut last_outside = p.z;
         for _ in 0..256 {
             let d = self.distance_vq(p);
@@ -773,6 +920,35 @@ mod tests {
             assert!(d.abs() < 0.05, "distance {d} at surface ({x}, {h}, {z})");
             assert!(field.distance(Vec3::new(x, h + 5.0, z)) > 0.0);
         }
+    }
+
+    #[test]
+    fn custom_heightmap_is_placed_in_world_units() {
+        // 8×8 texels of 10 m from (-40, -40): flat at -5 m (sea floor),
+        // with one 100 m column at texel (6, 1), i.e. x 20..30, z -30..-20.
+        let (w, h, c) = (8, 8, 10.0);
+        let mut heights = vec![-5.0; w * h];
+        heights[1 * w + 6] = 100.0;
+        let map = CustomHeightmap {
+            width: w,
+            height: h,
+            heights,
+            rockiness: vec![0.0; w * h], // no rocks: heights exactly as given
+            colors: Vec::new(),
+            origin: Vec2::new(-40.0, -40.0),
+            cell_size: c,
+        };
+        let field = TerrainField::from_custom(&VqWorldSettings::default(), &map);
+        // Texel centres are exact (bilinear filtering reproduces them).
+        let peak = field.height_at(25.0, -25.0);
+        assert!((peak - 100.0).abs() < 0.01, "peak {peak}");
+        let flat = field.height_at(-25.0, 25.0);
+        assert!((flat + 5.0).abs() < 0.01, "flat {flat}");
+        // Mirrored position (wrong Z flip) must be low.
+        assert!(field.height_at(25.0, 25.0) < 0.0);
+        // Sea at y = 0, and no tiling: beyond the map the edge is clamped.
+        assert!(field.settings.sea_height().abs() < 1.0e-3);
+        assert!((field.height_at(1000.0, 1000.0) + 5.0).abs() < 0.01);
     }
 
     #[test]
