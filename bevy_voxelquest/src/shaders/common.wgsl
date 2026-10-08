@@ -6,8 +6,14 @@
 
 #import bevy_pbr::{
     mesh_view_bindings::view,
-    view_transformations::position_ndc_to_world,
+    view_transformations::{position_ndc_to_world, frag_coord_to_ndc},
 }
+
+#ifndef PREPASS_PIPELINE
+#ifdef DEPTH_PREPASS
+#import bevy_pbr::prepass_utils::prepass_depth
+#endif
+#endif
 
 #ifndef PREPASS_PIPELINE
 #import bevy_pbr::{
@@ -133,6 +139,8 @@ struct Surface {
     ao: f32,
     // Extra 0..1 specular weight (wet / shiny materials).
     specular: f32,
+    // 0..1 multiplier on the shadow-map term for fine self-shadowing.
+    contact_shadow: f32,
 }
 
 #ifndef PREPASS_PIPELINE
@@ -165,6 +173,7 @@ fn shade_vq(s: Surface, frag_coord: vec4<f32>) -> vec3<f32> {
             );
         }
     }
+    shadow *= s.contact_shadow;
 
     // --- PreLighting ---
     let col_amount = mix(0.0625, 0.25, tod);
@@ -244,9 +253,29 @@ fn shade(s: Surface, frag_coord: vec4<f32>) -> vec4<f32> {
 
 #endif // !PREPASS_PIPELINE
 
+// --- Prepass reuse ------------------------------------------------------------
+
+#ifndef PREPASS_PIPELINE
+#ifdef DEPTH_PREPASS
+// When the camera has a depth prepass (required by TAA and SSAO), the prepass
+// has already ray-marched every pixel. The main pass reads the nearest
+// surface back instead of marching again: xyz = world position, w = depth
+// (0 when nothing opaque covers the pixel).
+fn prepass_surface(frag_coord: vec4<f32>) -> vec4<f32> {
+    let depth = prepass_depth(frag_coord, 0u);
+    let ndc = frag_coord_to_ndc(vec4(frag_coord.xy, depth, 1.0));
+    return vec4(position_ndc_to_world(vec3(ndc.xy, depth)), depth);
+}
+#endif
+#endif
+
 // --- Fragment outputs -------------------------------------------------------
 
 #ifdef PREPASS_PIPELINE
+#ifdef MOTION_VECTOR_PREPASS
+#import bevy_pbr::prepass_bindings::previous_view_uniforms
+#endif
+
 struct VqFragmentOutput {
 #ifdef NORMAL_PREPASS
     @location(0) normal: vec4<f32>,
@@ -257,15 +286,18 @@ struct VqFragmentOutput {
     @builtin(frag_depth) frag_depth: f32,
 }
 
-fn prepass_output(world: vec3<f32>, normal: vec3<f32>) -> VqFragmentOutput {
+// `previous_world` is where this surface point was last frame (equal to
+// `world` for static geometry); camera motion is accounted for here.
+fn prepass_output(world: vec3<f32>, previous_world: vec3<f32>, normal: vec3<f32>) -> VqFragmentOutput {
     var out: VqFragmentOutput;
 #ifdef NORMAL_PREPASS
     out.normal = vec4(normal * 0.5 + 0.5, 1.0);
 #endif
 #ifdef MOTION_VECTOR_PREPASS
-    // Static geometry: no motion (camera motion is handled by Bevy's TAA
-    // reprojection of the depth buffer).
-    out.motion_vector = vec2(0.0);
+    // Same convention as Bevy's prepass.wgsl.
+    let clip_t = view.unjittered_clip_from_world * vec4(world, 1.0);
+    let prev_t = previous_view_uniforms.clip_from_world * vec4(previous_world, 1.0);
+    out.motion_vector = (clip_t.xy / clip_t.w - prev_t.xy / prev_t.w) * vec2(0.5, -0.5);
 #endif
     out.frag_depth = depth_at(world);
     return out;

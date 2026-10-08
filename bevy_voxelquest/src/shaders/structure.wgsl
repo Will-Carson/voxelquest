@@ -16,6 +16,9 @@
 #else
 #import bevy_pbr::forward_io::VertexOutput
 #import bevy_voxelquest::common::shade
+#ifdef DEPTH_PREPASS
+#import bevy_voxelquest::common::prepass_surface
+#endif
 #endif
 
 struct Prim {
@@ -31,6 +34,8 @@ struct Prim {
 struct StructureParams {
     world_from_local: mat4x4<f32>,
     local_from_world: mat4x4<f32>,
+    // Last frame's transform, for motion vectors.
+    previous_world_from_local: mat4x4<f32>,
     // Local-space bounds; box_min.w = prim count, box_max.w = max steps.
     box_min: vec4<f32>,
     box_max: vec4<f32>,
@@ -339,7 +344,7 @@ struct Hit {
     pos: vec3<f32>, // VQ local space
 }
 
-fn march(in_world: vec3<f32>) -> Hit {
+fn march(in_world: vec3<f32>, frag_coord: vec4<f32>) -> Hit {
     let ray = view_ray(in_world);
     // March in the structure's local space so it can be moved/rotated/scaled.
     let o_local = (structure.local_from_world * vec4(ray.origin, 1.0)).xyz;
@@ -361,6 +366,24 @@ fn march(in_world: vec3<f32>) -> Hit {
     }
     t = max(t, range.x);
     t_end = min(t_end, range.y);
+
+#ifndef PREPASS_PIPELINE
+#ifdef DEPTH_PREPASS
+    // Main pass with a depth prepass: reuse the prepass hit if it lies on
+    // this structure, otherwise something else is in front.
+    let surface = prepass_surface(frag_coord);
+    if surface.w <= 0.0 {
+        discard;
+    }
+    let pv = to_vq((structure.local_from_world * vec4(surface.xyz, 1.0)).xyz);
+    if abs(solid_dist(pv)) > 0.02 {
+        discard;
+    }
+    var reused: Hit;
+    reused.pos = pv;
+    return reused;
+#endif
+#endif
 
     let max_steps = i32(structure.box_max.w);
     var hit = false;
@@ -394,14 +417,16 @@ fn march(in_world: vec3<f32>) -> Hit {
 
 @fragment
 fn fragment(in: VertexOutput) -> VqFragmentOutput {
-    let hit = march(in.world_position.xyz);
+    let hit = march(in.world_position.xyz, in.position);
     let n_vq = solid_normal(hit.pos);
-    let world = (structure.world_from_local * vec4(from_vq(hit.pos), 1.0)).xyz;
+    let local = vec4(from_vq(hit.pos), 1.0);
+    let world = (structure.world_from_local * local).xyz;
     // Normals transform with the inverse transpose.
     let normal = normalize((transpose(structure.local_from_world) * vec4(from_vq(n_vq), 0.0)).xyz);
 
 #ifdef PREPASS_PIPELINE
-    return prepass_output(world, normal);
+    let previous_world = (structure.previous_world_from_local * local).xyz;
+    return prepass_output(world, previous_world, normal);
 #else
     let solid = map_solid(hit.pos, true);
     var s: Surface;
@@ -411,10 +436,16 @@ fn fragment(in: VertexOutput) -> VqFragmentOutput {
     s.variation = solid.variation;
     s.ao = solid_ao(hit.pos, n_vq);
     s.specular = 0.0;
+    s.contact_shadow = 1.0;
 
     var out: VqFragmentOutput;
     out.color = shade(s, in.position);
+#ifdef DEPTH_PREPASS
+    // Bit-identical to the prepass, so the GreaterEqual depth test passes.
+    out.frag_depth = prepass_surface(in.position).w;
+#else
     out.frag_depth = depth_at(world);
+#endif
     return out;
 #endif
 }

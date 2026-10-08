@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use bevy::{
     asset::RenderAssetUsages,
+    light::NotShadowReceiver,
     image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor},
     mesh::MeshVertexBufferLayoutRef,
     pbr::{MaterialPipeline, MaterialPipelineKey},
@@ -39,7 +40,10 @@ pub struct VqTerrainPlugin;
 
 impl Plugin for VqTerrainPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(MaterialPlugin::<VqTerrainMaterial>::default())
+        app.add_plugins((
+            MaterialPlugin::<VqTerrainMaterial>::default(),
+            MaterialPlugin::<VqShadowProxyMaterial>::default(),
+        ))
             .init_resource::<VqShading>()
             .init_resource::<LoadedTiles>()
             .add_systems(
@@ -85,6 +89,10 @@ impl Plugin for VqTerrainPlugin {
         });
         let voro = world.resource_mut::<Assets<Image>>().add(voro);
 
+        let proxy = world
+            .resource_mut::<Assets<VqShadowProxyMaterial>>()
+            .add(VqShadowProxyMaterial {});
+        world.insert_resource(ShadowProxyMaterial(proxy));
         world.insert_resource(VqTerrain {
             field: Arc::new(field),
             heightmap,
@@ -194,6 +202,13 @@ pub struct VqTerrainMaterial {
 }
 
 impl Material for VqTerrainMaterial {
+    // Shadow maps are drawn from a cheap proxy mesh instead (see
+    // `VqShadowProxyMaterial`): ray-marching every shadow-map texel cost more
+    // than the rest of the frame put together.
+    fn enable_shadows() -> bool {
+        false
+    }
+
     fn fragment_shader() -> ShaderRef {
         shader_path("terrain.wgsl")
     }
@@ -224,6 +239,60 @@ impl VqShaded for VqTerrainMaterial {
     }
 }
 
+/// Invisible stand-in that casts each terrain tile's shadows: a heightfield
+/// mesh rasterised into the shadow maps only. It never draws in the main pass
+/// (the fragment shader discards) and is absent from camera prepasses.
+#[derive(Asset, TypePath, AsBindGroup, Clone)]
+pub struct VqShadowProxyMaterial {}
+
+impl Material for VqShadowProxyMaterial {
+    fn fragment_shader() -> ShaderRef {
+        shader_path("shadow_proxy.wgsl")
+    }
+
+    fn enable_prepass() -> bool {
+        false
+    }
+}
+
+#[derive(Resource)]
+struct ShadowProxyMaterial(Handle<VqShadowProxyMaterial>);
+
+/// Heightfield mesh over one tile, in tile-local XZ (origin at the tile's
+/// centre) and world-space Y, lowered by `bias` so the caster never rises
+/// above the ray-marched surface between samples (no shadow acne).
+fn shadow_proxy_mesh(samples: &TileSamples, tile: f32, bias: f32) -> Mesh {
+    let n = samples.n;
+    let step = tile / (n - 1) as f32;
+    let mut positions = Vec::with_capacity(n * n);
+    for j in 0..n {
+        for i in 0..n {
+            positions.push([
+                i as f32 * step - tile * 0.5,
+                samples.heights[j * n + i] - bias,
+                j as f32 * step - tile * 0.5,
+            ]);
+        }
+    }
+    let mut indices = Vec::with_capacity((n - 1) * (n - 1) * 6);
+    for j in 0..n - 1 {
+        for i in 0..n - 1 {
+            let a = (j * n + i) as u32;
+            let b = a + 1;
+            let c = a + n as u32;
+            let d = c + 1;
+            indices.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+    Mesh::new(
+        bevy::mesh::PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0f32, 1.0, 0.0]; n * n])
+    .with_inserted_indices(bevy::mesh::Indices::U32(indices))
+}
+
 // --- Tile streaming ------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
@@ -236,6 +305,7 @@ fn stream_tiles(
     mut loaded: ResMut<LoadedTiles>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<VqTerrainMaterial>>,
+    proxy_material: Res<ShadowProxyMaterial>,
 ) {
     let Some(terrain) = terrain else { return };
     let field = &terrain.field;
@@ -274,8 +344,9 @@ fn stream_tiles(
         .into_iter()
         .filter(|c| !loaded.0.contains_key(c))
         .collect();
-    let ranges = parallel_map(&new, |c| field.tile_height_range(*c));
-    for (coord, (min_h, max_h)) in new.into_iter().zip(ranges) {
+    let samples = parallel_map(&new, |c| field.tile_samples(*c, TILE_SAMPLES));
+    for (coord, samples) in new.into_iter().zip(samples) {
+        let (min_h, max_h) = (samples.min_height, samples.max_height);
         let min = Vec3::new(coord.x as f32 * tile, min_h, coord.y as f32 * tile);
         let max = Vec3::new(min.x + tile, max_h, min.z + tile);
 
@@ -301,6 +372,14 @@ fn stream_tiles(
                 Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
                 MeshMaterial3d(material),
                 Transform::from_translation((min + max) * 0.5),
+            ))
+            .with_child((
+                Name::new("VQ terrain shadow proxy"),
+                Mesh3d(meshes.add(shadow_proxy_mesh(&samples, tile, s.shadow_proxy_bias))),
+                MeshMaterial3d(proxy_material.0.clone()),
+                // The proxy mesh is in tile-local XZ with world heights.
+                Transform::from_translation(Vec3::new(0.0, -(min.y + max.y) * 0.5, 0.0)),
+                NotShadowReceiver,
             ))
             .id();
         loaded.0.insert(coord, entity);
@@ -495,25 +574,52 @@ impl TerrainField {
 
     /// Height range covered by a tile (with margins).
     pub fn tile_height_range(&self, coord: IVec2) -> (f32, f32) {
+        let samples = self.tile_samples(coord, TILE_SAMPLES);
+        (samples.min_height, samples.max_height)
+    }
+
+    /// Samples the topmost surface on an `n × n` grid over a tile
+    /// (`heights[z * n + x]`) and derives the tile's vertical bounds.
+    pub fn tile_samples(&self, coord: IVec2, n: usize) -> TileSamples {
         let s = &self.settings;
-        let samples = 17;
-        let rock_depth = s.rocks_large.depth + s.rocks_medium.depth + s.rocks_small.depth;
-        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
-        for j in 0..samples {
-            for i in 0..samples {
-                let x = (coord.x as f32 + i as f32 / (samples - 1) as f32) * s.tile_size;
-                let z = (coord.y as f32 + j as f32 / (samples - 1) as f32) * s.tile_size;
-                let h = self.height_at(x, z);
-                lo = lo.min(h);
-                hi = hi.max(h);
+        let n = n.max(2);
+        let step = s.tile_size / (n - 1) as f32;
+        let (x0, z0) = (coord.x as f32 * s.tile_size, coord.y as f32 * s.tile_size);
+        let mut heights = Vec::with_capacity(n * n);
+        for j in 0..n {
+            for i in 0..n {
+                heights.push(self.height_at(x0 + i as f32 * step, z0 + j as f32 * step));
             }
         }
+        let (lo, hi) = heights
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), &h| (lo.min(h), hi.max(h)));
         // Sampling can miss peaks and overhangs, and distant tiles render with
         // less rock detail (a higher surface), hence the margins.
+        let rock_depth = s.rocks_large.depth + s.rocks_medium.depth + s.rocks_small.depth;
         let margin = s.height_max * 0.04 + 2.0;
-        (lo - margin - rock_depth, hi + margin + rock_depth)
+        TileSamples {
+            n,
+            heights,
+            min_height: lo - margin - rock_depth,
+            max_height: hi + margin + rock_depth,
+        }
     }
 }
+
+/// Surface heights sampled over one tile.
+#[derive(Clone, Debug, Default)]
+pub struct TileSamples {
+    pub n: usize,
+    /// `heights[z * n + x]`, world-space heights.
+    pub heights: Vec<f32>,
+    /// Vertical bounds of everything the tile can render (with margins).
+    pub min_height: f32,
+    pub max_height: f32,
+}
+
+/// Grid used for tile bounds and the shadow proxy mesh.
+const TILE_SAMPLES: usize = 33;
 
 /// Runs `f` over `items` on all cores.
 pub(crate) fn parallel_map<T: Sync, R: Send + Default + Clone>(

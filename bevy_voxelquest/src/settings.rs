@@ -48,6 +48,10 @@ pub struct VqWorldSettings {
     /// Voxel Quest's final build only had grass on a narrow altitude band; set
     /// to 0 to use its rules unchanged.
     pub grass_flatness: f32,
+    /// How far the shadow-casting proxy mesh is lowered below the sampled
+    /// surface. Larger values avoid self-shadowing artefacts in rock cracks;
+    /// smaller values tighten contact shadows.
+    pub shadow_proxy_bias: f32,
 }
 
 /// One scale of Voronoi rock displacement (VQ `MapLand.c`).
@@ -112,6 +116,7 @@ impl Default for VqWorldSettings {
             view_radius_tiles: 6,
             max_steps: 160,
             grass_flatness: 0.8,
+            shadow_proxy_bias: 1.5,
         }
     }
 }

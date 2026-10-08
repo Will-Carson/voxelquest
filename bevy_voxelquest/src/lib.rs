@@ -106,6 +106,7 @@ impl Plugin for VqCorePlugin {
         embedded_asset!(app, "shaders/structure.wgsl");
         embedded_asset!(app, "shaders/water.wgsl");
         embedded_asset!(app, "shaders/sky.wgsl");
+        embedded_asset!(app, "shaders/shadow_proxy.wgsl");
 
         app.init_resource::<VqWorldSettings>()
             .register_type::<VqWorldSettings>()

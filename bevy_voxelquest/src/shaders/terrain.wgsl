@@ -2,12 +2,14 @@
 //
 // Rasterises the back faces of the tile's bounding box, marches the terrain
 // SDF inside the box and writes real depth, so the same shader serves the
-// main pass, the depth/normal prepass and shadow maps.
+// main pass and the camera's depth/normal/motion prepass. Shadow maps are
+// drawn from a cheap proxy mesh instead (terrain.rs), with fine
+// self-shadowing added here by `contact_shadow`.
 
 #import bevy_voxelquest::common::{
     view_ray, ray_box, to_vq, from_vq, Surface, VqFragmentOutput, is_orthographic, depth_at,
 }
-#import bevy_voxelquest::terrain_sdf::{terrain, ter_val, ter_dist, ter_normal}
+#import bevy_voxelquest::terrain_sdf::{terrain, ter_val, ter_dist, ter_normal, ter_march_dist}
 #import bevy_voxelquest::noise::hash_vec
 #import bevy_pbr::mesh_view_bindings::view
 
@@ -16,7 +18,11 @@
 #import bevy_voxelquest::common::prepass_output
 #else
 #import bevy_pbr::forward_io::VertexOutput
-#import bevy_voxelquest::common::shade
+#import bevy_pbr::mesh_view_bindings::lights
+#import bevy_voxelquest::common::{shade, shading}
+#ifdef DEPTH_PREPASS
+#import bevy_voxelquest::common::prepass_surface
+#endif
 #endif
 
 const MAT_SAND: u32 = 3u;
@@ -40,19 +46,16 @@ fn march(in_world: vec3<f32>) -> Hit {
 
     let o = to_vq(ray.origin);
     let d = to_vq(ray.dir);
-    // Detail fades with distance from the *viewer*; shadow views use the
-    // distance along their own ray, which keeps casters coarse but stable.
-    let ortho = is_orthographic();
     let cam = to_vq(view.world_position);
-    let max_steps = i32(terrain.tile_min.w);
 
+    let max_steps = i32(terrain.tile_min.w);
     var prev_t = t;
     var hit = false;
     var cam_dist = 0.0;
     for (var i = 0; i < max_steps; i++) {
         let p = o + d * t;
-        cam_dist = select(distance(p, cam), 0.0, ortho);
-        let dist = ter_dist(p, cam_dist);
+        cam_dist = distance(p, cam);
+        let dist = ter_march_dist(p, cam_dist);
         let tol = 0.01 + cam_dist * 0.0015;
         if dist < tol {
             hit = true;
@@ -128,6 +131,34 @@ fn classify(p: vec3<f32>, n: vec3<f32>, cam_dist: f32, out_mat: ptr<function, u3
     *out_var = variation;
 }
 
+#ifndef PREPASS_PIPELINE
+// Short soft-shadow march towards the light (VQ's `softShadow`) for the
+// small-scale self-shadowing of rocks and cracks that the coarse shadow
+// proxy can't resolve. Large-scale shadows come from the shadow maps.
+fn contact_shadow(p: vec3<f32>, n: vec3<f32>, cam_dist: f32) -> f32 {
+    var to_light = normalize(vec3(shading.fallback_light_x, shading.fallback_light_y, shading.fallback_light_z));
+    if lights.n_directional_lights > 0u {
+        to_light = lights.directional_lights[0].direction_to_light;
+    }
+    let l = to_vq(to_light);
+    if dot(n, l) <= 0.0 {
+        return 1.0; // facing away; the lighting term is already zero
+    }
+    let origin = p + n * (0.05 + cam_dist * 0.001);
+    var res = 1.0;
+    var t = 0.2;
+    for (var i = 0; i < 16; i++) {
+        let h = ter_dist(origin + l * t, cam_dist);
+        res = min(res, 6.0 * h / t);
+        t += clamp(h, 0.25, 4.0);
+        if res < 0.02 || t > 40.0 {
+            break;
+        }
+    }
+    return clamp(res, 0.0, 1.0);
+}
+#endif
+
 // SDF ambient occlusion: how much the terrain closes in along the normal.
 fn terrain_ao(p: vec3<f32>, n: vec3<f32>, cam_dist: f32) -> f32 {
     var occ = 0.0;
@@ -141,16 +172,56 @@ fn terrain_ao(p: vec3<f32>, n: vec3<f32>, cam_dist: f32) -> f32 {
     return clamp(1.0 - occ * 0.45, 0.0, 1.0);
 }
 
+#ifndef PREPASS_PIPELINE
+#ifdef DEPTH_PREPASS
+// Main pass with a depth prepass: shade the prepass hit if it is on this
+// tile's terrain, otherwise something else is in front, so discard.
+fn prepass_hit(frag_coord: vec4<f32>) -> Hit {
+    let s = prepass_surface(frag_coord);
+    let w = s.xyz;
+    let lo = terrain.tile_min.xyz - 0.01;
+    let hi = terrain.tile_max.xyz + 0.01;
+    if s.w <= 0.0 || any(w < lo) || any(w > hi) {
+        discard;
+    }
+    let cam_dist = distance(w, view.world_position);
+    let p = to_vq(w);
+    if abs(ter_dist(p, cam_dist)) > 0.05 + cam_dist * 0.004 {
+        discard;
+    }
+    var out: Hit;
+    out.pos = p;
+    out.cam_dist = cam_dist;
+    return out;
+}
+#endif
+#endif
+
 @fragment
 fn fragment(in: VertexOutput) -> VqFragmentOutput {
+#ifdef PREPASS_PIPELINE
     let hit = march(in.world_position.xyz);
-    let n_vq = ter_normal(hit.pos, hit.cam_dist);
+#else
+#ifdef DEPTH_PREPASS
+    let hit = prepass_hit(in.position);
+#else
+    let hit = march(in.world_position.xyz);
+#endif
+#endif
     let world = from_vq(hit.pos);
-    let normal = normalize(from_vq(n_vq));
 
 #ifdef PREPASS_PIPELINE
-    return prepass_output(world, normal);
+#ifdef NORMAL_PREPASS
+    let normal = normalize(from_vq(ter_normal(hit.pos, hit.cam_dist)));
 #else
+    // Depth-only prepass: no normal needed.
+    let normal = vec3(0.0, 1.0, 0.0);
+#endif
+    // Terrain is static: last frame it was in the same place.
+    return prepass_output(world, world, normal);
+#else
+    let n_vq = ter_normal(hit.pos, hit.cam_dist);
+    let normal = normalize(from_vq(n_vq));
     var mat: u32;
     var variation: f32;
     classify(hit.pos, n_vq, hit.cam_dist, &mat, &variation);
@@ -161,11 +232,17 @@ fn fragment(in: VertexOutput) -> VqFragmentOutput {
     s.mat = mat;
     s.variation = variation;
     s.ao = terrain_ao(hit.pos, n_vq, hit.cam_dist);
+    s.contact_shadow = contact_shadow(hit.pos, n_vq, hit.cam_dist);
     s.specular = select(0.0, 0.5, mat == MAT_SNOW);
 
     var out: VqFragmentOutput;
     out.color = shade(s, in.position);
+#ifdef DEPTH_PREPASS
+    // Bit-identical to the prepass, so the GreaterEqual depth test passes.
+    out.frag_depth = prepass_surface(in.position).w;
+#else
     out.frag_depth = depth_at(world);
+#endif
     return out;
 #endif
 }

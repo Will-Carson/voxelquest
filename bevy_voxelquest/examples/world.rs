@@ -10,6 +10,7 @@
 //! from `../data` (falls back to procedural terrain otherwise).
 
 use bevy::{
+    anti_alias::taa::TemporalAntiAliasing,
     core_pipeline::tonemapping::Tonemapping,
     input::mouse::AccumulatedMouseMotion,
     light::CascadeShadowConfigBuilder,
@@ -50,7 +51,7 @@ fn main() {
     })
     .add_plugins(VoxelQuestPlugins)
     .add_systems(Startup, setup)
-    .add_systems(Update, (fly_camera, toggles, screenshot));
+    .add_systems(Update, (fly_camera, toggles, screenshot, bench));
 
     #[cfg(feature = "physics")]
     app.add_plugins(avian3d::prelude::PhysicsPlugins::default())
@@ -137,12 +138,18 @@ fn setup(mut commands: Commands, terrain: Res<VqTerrain>, settings: Res<VqWorldS
     if pixelate > 1 {
         camera.insert(VqPixelate { factor: pixelate });
     }
+    // TAA smooths the aliasing of ray-marched edges and sub-pixel rock and
+    // brick detail. It adds a depth + motion-vector prepass; the VQ materials
+    // reuse that depth in the main pass instead of marching twice.
+    if std::env::var("VQ_NO_TAA").is_err() {
+        camera.insert((TemporalAntiAliasing::default(), Msaa::Off));
+    }
 
     commands.spawn((
         DirectionalLight {
             color: Color::srgb(1.0, 0.95, 0.85),
             illuminance: 10_000.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: std::env::var("VQ_NO_SHADOWS").is_err(),
             ..default()
         },
         Transform::default().looking_to(Vec3::new(-0.5, -0.7, -0.35), Vec3::Y),
@@ -365,6 +372,31 @@ fn drop_crates(
             )
             .with_rotation(Quat::from_euler(EulerRot::XYZ, a, a * 0.7, 0.0)),
         ));
+    }
+}
+
+/// `VQ_BENCH=N`: average the frame time over N frames (after warm-up) and exit.
+fn bench(
+    time: Res<Time<Real>>,
+    mut frames: Local<Vec<f32>>,
+    mut seen: Local<u32>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let Some(n) = std::env::var("VQ_BENCH").ok().and_then(|v| v.parse::<usize>().ok()) else {
+        return;
+    };
+    *seen += 1;
+    // Let terrain tiles, pipelines and colliders settle first.
+    if *seen <= env_or("VQ_BENCH_WARMUP", 8) {
+        return;
+    }
+    frames.push(time.delta_secs() * 1000.0);
+    if frames.len() == n {
+        let mut sorted = frames.clone();
+        sorted.sort_by(f32::total_cmp);
+        let mean = frames.iter().sum::<f32>() / n as f32;
+        println!("VQ_BENCH frames={n} mean_ms={mean:.1} median_ms={:.1}", sorted[n / 2]);
+        exit.write(AppExit::Success);
     }
 }
 

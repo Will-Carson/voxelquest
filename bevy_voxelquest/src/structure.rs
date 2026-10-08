@@ -356,6 +356,7 @@ struct PrimGpu {
 pub struct StructureParams {
     pub world_from_local: Mat4,
     pub local_from_world: Mat4,
+    pub previous_world_from_local: Mat4,
     pub box_min: Vec4,
     pub box_max: Vec4,
 }
@@ -430,6 +431,7 @@ fn build_structures(
             params: StructureParams {
                 world_from_local,
                 local_from_world: Mat4::inverse(&world_from_local),
+                previous_world_from_local: world_from_local,
                 box_min: min.extend(count as f32),
                 box_max: max.extend(structure.max_steps.max(8) as f32),
             },
@@ -443,20 +445,31 @@ fn build_structures(
     }
 }
 
-type MovedStructure = Or<(
-    Changed<GlobalTransform>,
-    Changed<MeshMaterial3d<VqStructureMaterial>>,
-)>;
-
+/// Keeps each structure material's current and previous transforms up to
+/// date (the previous one drives motion vectors for TAA / motion blur). Only
+/// touches materials whose transforms actually differ, so static structures
+/// cost nothing.
 fn sync_transforms(
-    moved: Query<(&GlobalTransform, &MeshMaterial3d<VqStructureMaterial>), MovedStructure>,
+    structures: Query<(&GlobalTransform, &MeshMaterial3d<VqStructureMaterial>)>,
     mut materials: ResMut<Assets<VqStructureMaterial>>,
 ) {
-    for (transform, handle) in &moved {
+    for (transform, handle) in &structures {
+        let world_from_local: Mat4 = transform.affine().into();
+        let Some(m) = materials.get(&handle.0) else {
+            continue;
+        };
+        let params = m.params;
+        let moved = params.world_from_local != world_from_local;
+        let settled = params.previous_world_from_local == params.world_from_local;
+        if !moved && settled {
+            continue;
+        }
         if let Some(mut m) = materials.get_mut(&handle.0) {
-            let world_from_local: Mat4 = transform.affine().into();
-            m.params.world_from_local = world_from_local;
-            m.params.local_from_world = world_from_local.inverse();
+            m.params.previous_world_from_local = params.world_from_local;
+            if moved {
+                m.params.world_from_local = world_from_local;
+                m.params.local_from_world = world_from_local.inverse();
+            }
         }
     }
 }

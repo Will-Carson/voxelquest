@@ -57,10 +57,10 @@ fn voro(uvw: vec3<f32>) -> f32 {
 }
 
 // VQ `getTerHeight`: returns (signed vertical distance, height 0..1).
-fn ter_height(p: vec3<f32>) -> vec2<f32> {
+// `h0` is the first octave sample, `hm_bilin(tc * map_freqs.x)`.
+fn ter_height_from(p: vec3<f32>, h0: vec2<f32>) -> vec2<f32> {
     let tc = p.xy / terrain.world_size;
     let tc2 = (p.xy + p.z * terrain.octave_shear) / terrain.world_size;
-    let h0 = hm_bilin(tc * terrain.map_freqs.x);
     let hm = vec4(
         h0.x,
         hm_bilin(tc2 * terrain.map_freqs.y).x,
@@ -72,6 +72,10 @@ fn ter_height(p: vec3<f32>) -> vec2<f32> {
     let cap = clamp(mix(0.5, 0.95, h0.y) + v2 * 0.05, 0.0, 1.0);
     dot_val = min(dot_val, cap);
     return vec2(p.z - dot_val * terrain.height_max, dot_val);
+}
+
+fn ter_height(p: vec3<f32>) -> vec2<f32> {
+    return ter_height_from(p, hm_bilin(p.xy / terrain.world_size * terrain.map_freqs.x));
 }
 
 fn fade(cam_dist: f32, fade_distance: f32) -> f32 {
@@ -122,6 +126,40 @@ fn ter_val(p: vec3<f32>, cam_dist: f32) -> TerVal {
 
 fn ter_dist(p: vec3<f32>, cam_dist: f32) -> f32 {
     return ter_val(p, cam_dist).dist;
+}
+
+// Most the bump and rock layers can add at this distance. They only ever
+// push the surface *down* (increase the distance), so the bare heightfield
+// is a lower bound of the full field that is at most this far off.
+fn detail_band(cam_dist: f32) -> f32 {
+    return terrain.bump_depth
+        + terrain.rock_large.y * fade(cam_dist, terrain.rock_large.w)
+        + terrain.rock_medium.y * fade(cam_dist, terrain.rock_medium.w)
+        + terrain.rock_small.y * fade(cam_dist, terrain.rock_small.w)
+        + 1.0;
+}
+
+// Distance for marching: exact near the surface, a cheap lower bound away
+// from it. Never returns less than `ter_dist`, so it never reports a false
+// hit, and stepping by it is as safe as stepping by the full field.
+fn ter_march_dist(p: vec3<f32>, cam_dist: f32) -> f32 {
+    let band = detail_band(cam_dist);
+    // Tier 0: one bilinear lookup. The higher octaves add at most the sum of
+    // their amplitudes, and the mesa cap is bounded by the first sample too.
+    let h0 = hm_bilin(p.xy / terrain.world_size * terrain.map_freqs.x);
+    let a = terrain.map_amps;
+    let cap_max = clamp(mix(0.5, 0.95, h0.y) + 0.05, 0.0, 1.0);
+    let upper = min(h0.x * a.x + a.y + a.z + a.w, cap_max);
+    let bound0 = p.z - upper * terrain.height_max;
+    if bound0 > band {
+        return bound0;
+    }
+    // Tier 1: the bare heightfield (no rocks).
+    let base = ter_height_from(p, h0).x;
+    if base > band {
+        return base;
+    }
+    return ter_dist(p, cam_dist);
 }
 
 // Central-difference normal, returned in VQ space.
